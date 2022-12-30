@@ -203,6 +203,21 @@ typedef struct ttf_cmap_format4_table
     uint16_t rangeShift; /* 2 × segCount - searchRange */
 } ttf_fmt4_t;
 
+typedef struct ttf_cmap_format12_table
+{
+    uint16_t format; /* Format number is set to 12 */
+    uint16_t reserved;
+    uint32_t length; /* This is the length in bytes of the subtable */
+    uint32_t language; /* see https://docs.microsoft.com/typography/opentype/spec/cmap#language */
+    uint32_t numGroups;
+} ttf_fmt12_t;
+
+typedef struct ttf_cmap_format12_sequential_map_group {
+    uint32_t startCharCode;
+    uint32_t endCharCode;
+    uint32_t startGlyphID;
+} ttf_fmt12_smg_t;
+
 typedef struct ttf_glyf_table_header
 {
     int16_t numberOfContours; /* simple glyph if >= 0. composite glyph if < 0 */
@@ -360,6 +375,7 @@ typedef struct ttf_parser_private_struct
     ttf_maxp_t *pmaxp;
     ttf_cmap_t *pcmap;
     ttf_fmt4_t *pfmt4;
+    ttf_fmt12_t *pfmt12;
     ttf_name_t *pname;
     ttf_hhea_t *phhea;
     uint16_t *phmtx;
@@ -373,6 +389,7 @@ typedef struct ttf_parser_private_struct
     int sloca;
     int scmap;
     int sfmt4;
+    int sfmt12;
     int sname;
     int shhea;
     int shmtx;
@@ -1283,7 +1300,7 @@ static int parse_fmt4(ttf_t *ttf, uint8_t *data, int dataSize, bool headers_only
     if (headers_only) return TTF_DONE;
 
     ttf->nchars = k;
-    ttf->chars = (uint16_t *)malloc(sizeof(uint16_t) * 2 * ttf->nchars);
+    ttf->chars = (uint32_t *)malloc(sizeof(uint32_t) * 2 * ttf->nchars);
     ttf->char2glyph = ttf->chars + ttf->nchars;
     k = 0;
     for (i = 0; i < segCount; i++)
@@ -1295,7 +1312,7 @@ static int parse_fmt4(ttf_t *ttf, uint8_t *data, int dataSize, bool headers_only
             ttf->chars[k] = startCode[i] + j;
             if (idRangeOffset[i] == 0)
             {
-                ttf->char2glyph[k] = startCode[i] + j + idDelta[i];
+                ttf->char2glyph[k] = (uint16_t)(startCode[i] + j + idDelta[i]);
             }
             else
             {
@@ -1306,6 +1323,59 @@ static int parse_fmt4(ttf_t *ttf, uint8_t *data, int dataSize, bool headers_only
             }
             k++;
         }
+    }
+    for (i = 0; i < ttf->nchars; i++)
+    {
+        j = ttf->char2glyph[i];
+        if (j >= ttf->nglyphs)
+            return TTF_ERR_FMT;
+        ttf->glyphs[j].index = j;
+        ttf->glyphs[j].symbol = ttf->chars[i];
+    }
+    return TTF_DONE;
+}
+
+static int parse_fmt12(ttf_t *ttf, uint8_t *data, int dataSize, bool headers_only)
+{
+    ttf_fmt12_t *tab;
+    int smgSize;
+    int i, j, k;
+    int maxGlyphID = 0;
+    int endGlyphID;
+    ttf_fmt12_smg_t *smgs;
+
+    if (dataSize < (int)sizeof(ttf_fmt12_t)) return TTF_ERR_FMT;
+    tab = (ttf_fmt12_t *)data;
+    conv32(tab->length);
+    conv32(tab->numGroups);
+    if (tab->length > dataSize)
+        return TTF_ERR_FMT;
+    smgSize = dataSize - sizeof(ttf_fmt12_t);
+    if( smgSize < sizeof(ttf_fmt12_smg_t) * tab->numGroups )
+        return TTF_ERR_FMT;
+    
+    smgs = (ttf_fmt12_smg_t *)(data + sizeof(ttf_fmt12_t));
+    for( i = 0u; i != tab->numGroups; i++ ) {
+      conv32( smgs[ i ].startCharCode );
+      conv32( smgs[ i ].endCharCode );
+      conv32( smgs[ i ].startGlyphID );
+      endGlyphID = smgs[ i ].startGlyphID + ( smgs[ i ].endCharCode - smgs[ i ].startCharCode );
+      if( maxGlyphID < endGlyphID )
+        maxGlyphID = endGlyphID;
+    }
+    
+    if (headers_only) return TTF_DONE;
+    
+    ttf->nchars = ttf->nglyphs;
+    ttf->chars = (uint32_t *)malloc(sizeof(uint32_t) * 2u * ttf->nchars);
+    ttf->char2glyph = ttf->chars + ttf->nchars;
+    memset(ttf->chars, 0, sizeof(uint32_t) * 2u * ttf->nchars);
+    for( i = 0u; i != tab->numGroups; i++ ) {
+      k = smgs[ i ].startGlyphID;
+      for( j = smgs[ i ].startCharCode; j <= smgs[ i ].endCharCode; j++, k++ ) {
+        ttf->chars[ k ] = j;
+        ttf->char2glyph[ k ] = k;
+      }
     }
     for (i = 0; i < ttf->nchars; i++)
     {
@@ -1333,6 +1403,26 @@ static int locate_fmt4_table(pps_t *s)
         if (big16toh(format) != 4) continue;
         s->pfmt4 = (ttf_fmt4_t *)((char *)s->pcmap + offset);
         s->sfmt4 = s->scmap - offset;
+        return TTF_DONE;
+    }
+    return TTF_ERR_UTAB;
+}
+
+static int locate_fmt12_table(pps_t *s)
+{
+    int i;
+    if (s->scmap < 4) return TTF_ERR_FMT;
+    if (s->pcmap->version != 0) return TTF_ERR_UTAB;
+    int ntab = big16toh(s->pcmap->numTables);
+    if (ntab * 8 + 4 > s->scmap) return TTF_ERR_FMT;
+    for (i = 0; i < ntab; i++)
+    {
+        int offset = big32toh(s->pcmap->encRecs[i].offset);
+        if (offset + 4 > s->scmap || offset + 4 < 0) return TTF_ERR_FMT;
+        uint16_t format = *(uint16_t *)((char *)s->pcmap + offset);
+        if (big16toh(format) != 12) continue;
+        s->pfmt12 = (ttf_fmt12_t *)((char *)s->pcmap + offset);
+        s->sfmt12 = s->scmap - offset;
         return TTF_DONE;
     }
     return TTF_ERR_UTAB;
@@ -1565,11 +1655,24 @@ int ttf_load_from_mem(const uint8_t *data, int size, ttf_t **output, bool header
     result = parse_os2_table(ttf, &s);
     if (result != TTF_DONE) goto error;
 
-    result = locate_fmt4_table(&s);
-    if (result != TTF_DONE) goto error;
-
-    result = parse_fmt4(ttf, (uint8_t *)s.pfmt4, s.sfmt4, headers_only);
-    if (result != TTF_DONE) goto error;
+    result = locate_fmt12_table(&s);
+    if (result == TTF_DONE) {
+      result = parse_fmt12(ttf, (uint8_t *)s.pfmt12, s.sfmt12, headers_only);
+      if (result != TTF_DONE) {
+        result = locate_fmt4_table(&s);
+        if (result != TTF_DONE) goto error;
+      
+        result = parse_fmt4(ttf, (uint8_t *)s.pfmt4, s.sfmt4, headers_only);
+        if (result != TTF_DONE) goto error;
+      }
+    }
+    else {
+      result = locate_fmt4_table(&s);
+      if (result != TTF_DONE) goto error;
+     
+      result = parse_fmt4(ttf, (uint8_t *)s.pfmt4, s.sfmt4, headers_only);
+      if (result != TTF_DONE) goto error;
+    }
 
     if (!headers_only)
     {
@@ -1921,10 +2024,10 @@ ttf_t **ttf_list_system_fonts(const char *mask)
     return ttf_list_fonts(directories, dir_count, mask);
 }
 
-int ttf_find_glyph(const ttf_t *ttf, uint16_t utf16)
+int ttf_find_glyph(const ttf_t *ttf, uint32_t utf32)
 {
     if (ttf->nchars == 0) return -1;
-    if (ttf->nchars == 1) return ttf->chars[0] == utf16 ? 0 : -1;
+    if (ttf->nchars == 1) return ttf->chars[0] == utf32 ? 0 : -1;
 
     /* range half division algorithm */
     /* searching with O(log2(N)) */
@@ -1933,16 +2036,16 @@ int ttf_find_glyph(const ttf_t *ttf, uint16_t utf16)
     int rsi = ttf->nchars - 1; /* right side index */
 
     /* trivial cases */
-    if (ttf->chars[lsi] == utf16) return ttf->char2glyph[lsi];
-    if (ttf->chars[rsi] == utf16) return ttf->char2glyph[rsi];
+    if (ttf->chars[lsi] == utf32) return ttf->char2glyph[lsi];
+    if (ttf->chars[rsi] == utf32) return ttf->char2glyph[rsi];
 
     /* loop */
     while (rsi - lsi > 1)
     {
-        int mid = (lsi + rsi) / 2;
-        if (ttf->chars[mid] == utf16)
+        uint32_t mid = (lsi + rsi) / 2u;
+        if (ttf->chars[mid] == utf32)
             return ttf->char2glyph[mid];
-        if (ttf->chars[mid] > utf16)
+        if (ttf->chars[mid] > utf32)
             rsi = mid; else
             lsi = mid;
     }
