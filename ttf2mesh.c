@@ -36,7 +36,7 @@
 /* --------------- System dependent definitions and includes ---------------- */
 
 /* General OS selection definition */
-#if defined(__linux) || defined(__linux__)
+#if defined(__linux) || defined(__linux__) || defined(__APPLE__)
 #   define TTF_LINUX
 #   define _DEFAULT_SOURCE 1
 #   define PATH_SEP '/'
@@ -51,11 +51,20 @@
 
 #include "ttf2mesh.h"
 #include <string.h>
+#ifdef TTF_WINDOWS
 #include <malloc.h>
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef PATH_SEP
+#define PATH_SEP '/'
+#endif
 
 /* Big/little endian definitions */
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
